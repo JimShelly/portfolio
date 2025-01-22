@@ -1,0 +1,420 @@
+﻿// Importing necessary namespaces
+using System;
+using System.Data.OleDb;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using System.Windows.Forms;
+using System.Reflection;
+
+namespace Purge
+{
+    class Program
+    {
+        [STAThread]
+        static void Main(string[] args)
+        {
+            try
+            {
+                // Check for settings argument in any position
+                if (args.Contains("--settings", StringComparer.OrdinalIgnoreCase))
+                {
+                    OpenSettingsWindow();
+                    return;
+                }
+
+                // Load settings
+                var settings = AppSettings.Load();
+
+                // Get date input from user
+                Console.Write("Enter a date (optional, format YYYY-MM-DD): ");
+                string dateInput = Console.ReadLine();
+                DateTime filterDate = ValidateDateInput(dateInput);
+
+                Console.WriteLine($"Using filter date: {filterDate:yyyy-MM-dd}");
+
+                // Clone databases
+                CloneDatabases(settings);
+
+                // Process tables
+                ProcessTables(settings, filterDate);
+
+                Console.WriteLine("Data transfer completed successfully.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"An error occurred: {ex.Message}");
+            }
+        }
+
+        static DateTime ValidateDateInput(string dateInput)
+        {
+            if (string.IsNullOrWhiteSpace(dateInput))
+            {
+                return DateTime.Now.AddDays(365);
+            }
+
+            if (DateTime.TryParse(dateInput, out DateTime filterDate))
+            {
+                if (filterDate < DateTime.Now.AddYears(1))
+                {
+                    string randomWord = GenerateRandomWord();
+                    Console.WriteLine($"The date provided is less than a year old. Please type the following word to proceed: {randomWord}");
+                    string userInput = Console.ReadLine();
+
+                    if (userInput != randomWord)
+                    {
+                        Console.WriteLine("The word you entered does not match. Exiting application.");
+                        Environment.Exit(1);
+                    }
+                }
+                return filterDate;
+            }
+
+            Console.WriteLine("Invalid date. Please enter a valid date.");
+            Environment.Exit(1);
+            return DateTime.MinValue; // Will never reach here
+        }
+
+        static string GenerateRandomWord()
+        {
+            var random = new Random();
+            const string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+            return new string(Enumerable.Repeat(chars, 8).Select(s => s[random.Next(s.Length)]).ToArray());
+        }
+
+        static void OpenSettingsWindow()
+        {
+            var appSettings = JsonSerializer.Deserialize<AppSettings>(AppSettings.DefaultJson);
+
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+
+            var form = new Form
+            {
+                Text = "Settings",
+                Width = 500,
+                Height = 600
+            };
+
+            var textBox = new TextBox
+            {
+                Multiline = true,
+                Dock = DockStyle.Fill,
+                Text = JsonSerializer.Serialize(appSettings, new JsonSerializerOptions { WriteIndented = true })
+            };
+
+            var saveButton = new Button
+            {
+                Text = "Save",
+                Dock = DockStyle.Bottom
+            };
+
+            var cancelButton = new Button
+            {
+                Text = "Cancel",
+                Dock = DockStyle.Bottom
+            };
+
+            cancelButton.Click += (sender, e) =>
+            {
+                form.Close();
+            };
+
+            saveButton.Click += (sender, e) =>
+            {
+                try
+                {
+                    var updatedSettings = JsonSerializer.Deserialize<AppSettings>(textBox.Text);
+                    File.WriteAllText("appsettings.json", JsonSerializer.Serialize(updatedSettings, new JsonSerializerOptions { WriteIndented = true }));
+                    MessageBox.Show("Settings saved successfully!", "Success", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show($"Error saving settings: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+            };
+
+            var buttonPanel = new Panel
+            {
+                Dock = DockStyle.Bottom,
+                Height = 40
+            };
+
+            buttonPanel.Controls.Add(saveButton);
+            buttonPanel.Controls.Add(cancelButton);
+
+            form.Controls.Add(textBox);
+            form.Controls.Add(buttonPanel);
+
+            Application.Run(form);
+        }
+
+        static void CloneDatabases(AppSettings settings)
+        {
+            try
+            {
+                CloneDatabase(settings.SourceConnectionString1, settings.DestinationConnectionString1);
+                CloneDatabase(settings.SourceConnectionString2, settings.DestinationConnectionString2);
+                CloneDatabase(settings.SourceConnectionString3, settings.DestinationConnectionString3);
+            }
+            catch (Exception ex)
+            {
+                throw new Exception("Error while cloning databases", ex);
+            }
+        }
+
+        static void CloneDatabase(string sourceConnectionString, string destinationConnectionString)
+        {
+            string sourceFilePath = new OleDbConnectionStringBuilder(sourceConnectionString).DataSource;
+            string destFilePath = new OleDbConnectionStringBuilder(destinationConnectionString).DataSource;
+
+            if (File.Exists(destFilePath))
+            {
+                File.Delete(destFilePath);
+            }
+
+            CreateEmptyDatabase(destFilePath);
+
+            using var sourceConnection = new OleDbConnection(sourceConnectionString);
+            sourceConnection.Open();
+
+            using var destConnection = new OleDbConnection(destinationConnectionString);
+            destConnection.Open();
+
+            foreach (var table in GetTableNames(sourceConnection))
+            {
+                string createTableQuery = GetCreateTableScript(sourceConnection, table);
+                using var createTableCommand = new OleDbCommand(createTableQuery, destConnection);
+                createTableCommand.ExecuteNonQuery();
+            }
+        }
+
+        static void CreateEmptyDatabase(string filePath)
+        {
+            Type accessType = Type.GetTypeFromProgID("Access.Application");
+            if (accessType == null)
+            {
+                throw new InvalidOperationException("Microsoft Access is not installed.");
+            }
+
+            dynamic accessApp = Activator.CreateInstance(accessType);
+            try
+            {
+                accessApp.NewCurrentDatabase(filePath);
+            }
+            finally
+            {
+                accessApp.Quit();
+                System.Runtime.InteropServices.Marshal.ReleaseComObject(accessApp);
+            }
+        }
+
+        static string[] GetTableNames(OleDbConnection connection)
+        {
+            var tableNames = new System.Collections.Generic.List<string>();
+            using var schemaTable = connection.GetSchema("Tables");
+            foreach (System.Data.DataRow row in schemaTable.Rows)
+            {
+                if (row["TABLE_TYPE"].ToString() == "TABLE")
+                {
+                    tableNames.Add(row["TABLE_NAME"].ToString());
+                }
+            }
+            return tableNames.ToArray();
+        }
+
+        static string GetCreateTableScript(OleDbConnection connection, string tableName)
+        {
+            return $"CREATE TABLE {tableName} (...);"; // Replace with actual script generation logic.
+        }
+
+        static void ProcessTables(AppSettings settings, DateTime filterDate)
+        {
+            using var sourceConnection1 = new OleDbConnection(settings.SourceConnectionString1);
+            using var sourceConnection2 = new OleDbConnection(settings.SourceConnectionString2);
+            using var sourceConnection3 = new OleDbConnection(settings.SourceConnectionString3);
+
+            using var destConnection1 = new OleDbConnection(settings.DestinationConnectionString1);
+            using var destConnection2 = new OleDbConnection(settings.DestinationConnectionString2);
+            using var destConnection3 = new OleDbConnection(settings.DestinationConnectionString3);
+
+            sourceConnection1.Open();
+            sourceConnection2.Open();
+            sourceConnection3.Open();
+
+            destConnection1.Open();
+            destConnection2.Open();
+            destConnection3.Open();
+
+            foreach (var table in settings.Tables)
+            {
+                Console.WriteLine($"Processing table: {table}");
+
+                string query = $"SELECT * FROM {table} WHERE DateColumn <= ?";
+
+                using var command1 = new OleDbCommand(query, sourceConnection1);
+                using var command2 = new OleDbCommand(query, sourceConnection2);
+                using var command3 = new OleDbCommand(query, sourceConnection3);
+
+                command1.Parameters.AddWithValue("?", filterDate);
+                command2.Parameters.AddWithValue("?", filterDate);
+                command3.Parameters.AddWithValue("?", filterDate);
+
+                using var reader1 = command1.ExecuteReader();
+                using var reader2 = command2.ExecuteReader();
+                using var reader3 = command3.ExecuteReader();
+
+                string insertQuery = $"INSERT INTO {table} (Columns...) VALUES (...)";
+
+                using var insertCommand1 = new OleDbCommand(insertQuery, destConnection1);
+                using var insertCommand2 = new OleDbCommand(insertQuery, destConnection2);
+                using var insertCommand3 = new OleDbCommand(insertQuery, destConnection3);
+
+                while (reader1.Read())
+                {
+                    insertCommand1.ExecuteNonQuery();
+                }
+
+                while (reader2.Read())
+                {
+                    insertCommand2.ExecuteNonQuery();
+                }
+
+                while (reader3.Read())
+                {
+                    insertCommand3.ExecuteNonQuery();
+                }
+            }
+        }
+    }
+
+    public static class ResourceLoader
+    {
+        /// <summary>
+        /// Loads an embedded resource file and returns its content as a string.
+        /// </summary>
+        /// <param name="resourceName">The full name of the embedded resource (namespace included).</param>
+        /// <returns>The content of the resource file as a string.</returns>
+        /// <exception cref="ArgumentException">Thrown if the resource is not found.</exception>
+        public static string LoadEmbeddedResource(string resourceName)
+        {
+            var assembly = Assembly.GetExecutingAssembly();
+
+            using (Stream stream = assembly.GetManifestResourceStream(resourceName))
+            {
+                if (stream == null)
+                {
+                    throw new ArgumentException($"Resource '{resourceName}' not found. Ensure the name is correct and the file is embedded as a resource.");
+                }
+
+                using (StreamReader reader = new StreamReader(stream))
+                {
+                    return reader.ReadToEnd();
+                }
+            }
+        }
+    }
+
+    public class AppSettings
+    {
+        public string SourceConnectionString1 { get; set; }
+        public string SourceConnectionString2 { get; set; }
+        public string SourceConnectionString3 { get; set; }
+        public string DestinationConnectionString1 { get; set; }
+        public string DestinationConnectionString2 { get; set; }
+        public string DestinationConnectionString3 { get; set; }
+        public string[] Tables { get; set; }
+
+        public const string DefaultJson = @{ 
+            \"ConnectionStringProd"": \"Data Source=Source1.accdb;\",
+            \"SourceConnectionString2\": \"Data Source=Source2.accdb;\",
+            \"SourceConnectionString3\": \"Data Source=Source3.accdb;\",
+            \"DestinationConnectionString1\": \"Data Source=Dest1.accdb;\",
+            \"DestinationConnectionString2\": \"Data Source=Dest2.accdb;\",
+            \"DestinationConnectionString3\": \"Data Source=Dest3.accdb;\",
+            \"Tables\": [\"Table1\", \"Table2\", \"Table3\"]
+        }`;
+
+        public static AppSettings Load()
+    {
+        const string fileName = "appsettings.json";
+
+        if (File.Exists(fileName))
+        {
+            var json = File.ReadAllText(fileName);
+            return JsonSerializer.Deserialize<AppSettings>(json);
+        }
+        else
+        {
+            return JsonSerializer.Deserialize<AppSettings>(DefaultJson);
+        }
+    }
+    }
+
+    public class OleDbConnectionStringBuilder
+    {
+        private readonly OleDbConnectionStringBuilder builder;
+
+        public OleDbConnectionStringBuilder(string connectionString)
+        {
+            builder = new OleDbConnectionStringBuilder(connectionString);
+        }
+
+        public string DataSource
+        {
+            get
+            {
+                return builder["Data Source"].ToString();
+            }
+        }
+    }
+
+    public class JsonEditorForm : Form
+    {
+        private RichTextBox editor;
+        private string filePath;
+
+        public JsonEditorForm(string filePath)
+        {
+            this.filePath = filePath;
+
+            Text = "Edit appsettings.json";
+            Width = 800;
+            Height = 600;
+
+            // Initialize RichTextBox for editing
+            editor = new RichTextBox
+            {
+                Dock = DockStyle.Fill,
+                Font = new System.Drawing.Font("Consolas", 10) // For better JSON readability
+            };
+            Controls.Add(editor);
+
+            // Load file content into the editor
+            if (File.Exists(filePath))
+            {
+                editor.Text = File.ReadAllText(filePath);
+            }
+
+            // Add Save button
+            var saveButton = new Button
+            {
+                Text = "Save",
+                Dock = DockStyle.Bottom
+            };
+            saveButton.Click += SaveButton_Click;
+
+            Controls.Add(saveButton);
+        }
+
+        /// <summary>
+        /// Handles the Save button click event.
+        /// </summary>
+        private void SaveButton_Click(object sender, EventArgs e)
+        {
+            File.WriteAllText(filePath, editor.Text);
+            MessageBox.Show($"File saved successfully to {filePath}");
+        }
+    }
+}
